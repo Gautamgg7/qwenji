@@ -444,10 +444,11 @@ async function* runTurn(token, { model, chatType, prompt, files, effort, size })
     if (phase === "image_gen" && status === "finished") { yield { type: "media_done" }; continue; }
     if (typeof phase === "string" && phase.endsWith("_gen") && status === "typing" && d.content) { yield { type: "media", data: d.content, extra: d.extra }; continue; }
     if (typeof phase === "string" && phase.endsWith("_gen") && status === "finished") { yield { type: "media_done" }; continue; }
-    if (d.reasoning) yield { type: "reasoning", data: d.reasoning };
+    if (d.reasoning || d.reasoning_content) yield { type: "reasoning", data: d.reasoning || d.reasoning_content };
     else if (d.content && phase === "answer") yield { type: "content", data: d.content };
     else if (d.content && phase === "think") yield { type: "reasoning", data: d.content };
     else if (typeof ev.content === "string" && ev.content) yield { type: "content", data: ev.content };
+    else if (typeof ev.reasoning_content === "string" && ev.reasoning_content) yield { type: "reasoning", data: ev.reasoning_content };
   }
 }
 
