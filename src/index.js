@@ -839,6 +839,7 @@ async function handleChat(req, env, qwenOverride) {
   const readable = new ReadableStream({
     async start(controller) {
       const enc = (s) => controller.enqueue(new TextEncoder().encode(s));
+      let anyToolCalls = false;
       const attempt = async (token) => {
         const { files } = await run(token);
         let toolBuf = "";
@@ -850,7 +851,7 @@ async function handleChat(req, env, qwenOverride) {
         }
         if (wantsTools) {
           const tc = xmlToolCalls(toolBuf);
-          if (tc) enc(chunk(r.requested, { tool_calls: tc }));
+          if (tc) { anyToolCalls = true; enc(chunk(r.requested, { tool_calls: tc })); }
           else if (toolBuf) enc(chunk(r.requested, { content: toolBuf }));
         }
       };
@@ -872,7 +873,7 @@ async function handleChat(req, env, qwenOverride) {
           }
         }
         if (!done) throw lastErr || new UpstreamError("No Qwen tokens and no session to mint from", 401, false);
-        enc(chunk(r.requested, {}, "stop"));
+        enc(chunk(r.requested, {}, anyToolCalls ? "tool_calls" : "stop"));
         enc("data: [DONE]\n\n");
       } catch (e) {
         enc(chunk(r.requested, { content: `\n[upstream error: ${String(e.message).slice(0, 160)}]` }));
