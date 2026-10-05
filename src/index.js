@@ -85,18 +85,31 @@ const SPECIAL = {
   "qwen-web-dev": "web_dev",
   "qwen-full-stack": "web_dev",
   "qwen-slides": "slides",
+  "qwen-agent": "agent_mode",
+  "qwen-podcast": "aipodcast",
+  "qwen-translate": "translate",
 };
 
-/** model-name suffix -> chat_type (mirrors Qwen-Reverse server) */
+/** chat_type -> sub_chat_type override (app sends lite for agent mode). */
+const SUB_CHAT_TYPE = { agent_mode: "lite" };
+
+/** model-name suffix -> chat_type (mirrors the web app's mode map) */
 const SUFFIXES = [
   ["-deep-research", "deep_research"], ["-deepresearch", "deep_research"],
+  ["-deep-research-webdev", "deep_research_webdev"],
+  ["-deep-thinking", "deep_thinking"],
   ["-full-stack", "web_dev"], ["-fullstack", "web_dev"], ["-web-dev", "web_dev"], ["-webdev", "web_dev"],
   ["-artifacts", "artifacts"], ["-artifact", "artifacts"],
   ["-slides", "slides"], ["-slide", "slides"],
   ["-learn", "learn"], ["-travel", "travel"],
+  ["-travel-research", "travel_research"],
+  ["-podcast", "aipodcast"],
+  ["-translate", "translate"],
+  ["-agent", "agent_mode"],
+  ["-mcp", "mcp"],
   ["-search", "search"],
   ["-image", "t2i"], ["-t2i", "t2i"],
-  ["-video", "t2v"], ["-t2v", "t2v"],
+  ["-video", "t2v"], ["-t2v", "t2v"], ["-i2v", "t2v"],
 ];
 
 /* ---------------- generic helpers ---------------- */
@@ -481,12 +494,13 @@ async function* sseEvents(res) {
 async function* runTurn(token, { model, chatType, prompt, files, effort, size }) {
   const chatId = await apiNewChat(token, model, chatType, prompt.slice(0, 60));
   const now = Date.now();
+  const subChat = SUB_CHAT_TYPE[chatType] || chatType;
   const msg = {
     fid: crypto.randomUUID(), parentId: null, childrenIds: [],
     role: "user", content: prompt, user_action: "chat", files: files || [],
     timestamp: now, models: [model], chat_type: chatType,
     feature_config: featureConfig(effort),
-    extra: { meta: { subChatType: chatType } }, sub_chat_type: chatType,
+    extra: { meta: { subChatType: subChat } }, sub_chat_type: subChat,
   };
   const payload = {
     stream: true, version: "2.1", incremental_output: true, chat_id: chatId,
@@ -527,6 +541,7 @@ async function* runTurn(token, { model, chatType, prompt, files, effort, size })
     if (typeof phase === "string" && phase.endsWith("_gen") && status === "typing" && d.content) { yield { type: "media", data: d.content, extra: d.extra }; continue; }
     if (typeof phase === "string" && phase.endsWith("_gen") && status === "finished") { yield { type: "media_done" }; continue; }
     if (d.reasoning || d.reasoning_content) yield { type: "reasoning", data: d.reasoning || d.reasoning_content };
+    else if (typeof d.tts === "string" && d.tts) yield { type: "tts", data: d.tts };
     else if (d.content && phase === "answer") yield { type: "content", data: d.content };
     else if (d.content && phase === "think") yield { type: "reasoning", data: d.content };
     else if (typeof ev.content === "string" && ev.content) yield { type: "content", data: ev.content };
@@ -620,6 +635,72 @@ async function toB64(url, cap = 15 * 1024 * 1024) {
   for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode(...buf.subarray(i, i + 0x8000));
   return btoa(s);
 }
+
+/* ---------------- llms.txt (agent docs) ---------------- */
+
+const LLMS_TXT = `# qwen-code-proxy
+
+OpenAI-compatible + Anthropic-compatible gateway for Qwen chat models,
+running on Cloudflare Workers. Unofficial; not affiliated with Alibaba/Qwen.
+
+Base URL: https://<worker>/v1
+Auth: Authorization: Bearer <PROXY_KEY> (server-gated). Optional per-request
+Qwen token override: X-Qwen-Token: <qwen-jwt>.
+
+## Endpoints
+
+- GET /health — status {ok,gated,pool_size,auto_refresh,sessions}
+- GET /v1/models — model list (live from upstream when possible)
+- GET|POST /v1/validate — validate token (?token=, {"token"}, or pool report)
+- GET|POST /v1/refresh — mint a fresh token from sessions (refreshed:true)
+- POST /v1/chat/completions — OpenAI chat (stream + non-stream)
+- POST /v1/messages — Anthropic Messages API (stream + non-stream)
+- POST /v1/images/generations — {prompt,size,response_format:url|b64_json}
+- POST /v1/images/edits — one image (multipart file or JSON url/base64) + prompt
+- POST /v1/videos/generations — {prompt,image?,size,response_format}
+- POST /v1/audio/speech — {input (max 4000 chars)} -> audio/wav bytes (24kHz mono)
+- GET /llms.txt — this file
+
+## Chat parameters (OpenAI superset)
+
+- model, messages, stream, temperature (accepted), reasoning_effort
+- thinking_mode: fast (default) | auto | thinking (precedence over reasoning_effort)
+- reasoning_effort: none|minimal->fast, low|medium->auto, high|xhigh|max->thinking
+- web_search_options: {} -> web search mode (legacy tools:[{type:web_search}] ok)
+- tools + tool_choice auto|none|{type:function,function:{name}} -> tool_calls via XML bridge
+- multimodal content parts: text, image_url (any file URL/base64), file {file_data|url,filename}, input_audio {data,format}
+
+## File rules (agent mode)
+
+- images<=5x20MB, audio<=1, video<=1, documents<=5x20MB; total<=10 files/50MB
+- VALID: multi-image, multi-doc, media+document, single media
+- INVALID (400): image+audio, image+video, audio+video, multi-video, multi-audio
+- Failed downloads/uploads are skipped, request continues text-only
+
+## Model IDs
+
+- Text: qwen3.8-max, qwen3.8-omni-flash, qwen3.7-max, qwen3.7-plus, qwen3.6-plus,
+  qwen3.5-plus, qwen3.5-omni-plus, qwen3-coder-plus (plus upstream list)
+- Suffix modes (append to any text model): -search -thinking -deep-research
+  -artifacts -slides -web-dev -full-stack -learn -travel -travel-research
+  -podcast -translate -agent -mcp -deep-thinking -image -video (-t2i/-t2v/-i2v)
+- Special: qwen-image qwen-video qwen-deep-research qwen-web-dev qwen-full-stack
+  qwen-slides qwen-agent qwen-podcast qwen-translate
+- claude-* aliases map to qwen3.8-max (suffix preserved)
+
+## Anthropic mapping (/v1/messages)
+
+- system string|blocks, messages with text|image|tool_use|tool_result blocks
+- tools use input_schema; tool_choice auto|none|{type:tool,name}
+- Returns message with text|tool_use blocks, stop_reason end_turn|tool_use
+- Streaming uses message_start/content_block_delta/message_delta/message_stop
+
+## Notes
+
+- reasoning_content is best-effort (upstream sends summaries when it chooses to).
+- Token pool rotates randomly with failover; dead sessions auto-mint replacements.
+- Errors are OpenAI-style {error:{message,type,code}} (Anthropic shape on /v1/messages).
+`;
 
 /* ---------------- route handlers ---------------- */
 
@@ -818,9 +899,9 @@ async function handleMedia(req, env, qwenOverride, kind) {
         if (ev.type === "media" && ev.data) urls.push(ev.data);
         else if (ev.type === "content" && ev.data) texts.push(ev.data);
       }
-      // Fallback: video URLs sometimes arrive embedded in answer text.
+      // Fallback: media URLs sometimes arrive embedded in answer text.
       const joined = texts.join(" ");
-      const m = joined.match(/https?:\/\/[^\s"'<>]+\.(mp4|webm|mov|png|jpe?g|webp|gif)(\?[^\s"'<>]*)?/gi);
+      const m = joined.match(/https?:\/\/[^\s"'<>]+\.(mp4|webm|mov|mp3|wav|m4a|ogg|opus|flac|png|jpe?g|webp|gif)(\?[^\s"'<>]*)?/gi);
       if (m) for (const u of m) if (!urls.includes(u)) urls.push(u);
       void needUpload;
       if (!urls.length) throw new UpstreamError("Upstream returned no media URL", 502, true);
@@ -836,6 +917,305 @@ async function handleMedia(req, env, qwenOverride, kind) {
   } catch (e) {
     return oerr(`Upstream error: ${e.message}`, e.httpStatus === 400 ? "invalid_request_error" : "upstream_error", e.httpStatus || 502);
   }
+}
+
+/** Fetch chat messages (for ids etc.). Returns array (may be empty). */
+async function chatMessages(token, chatId) {
+  const r = await fetch(`${UPSTREAM}/api/v2/chats/${encodeURIComponent(chatId)}`, {
+    headers: await upstreamHeaders(token),
+  });
+  const t = await r.text();
+  if (!r.ok) throw new UpstreamError(`chat fetch ${r.status}`, r.status === 401 ? 401 : 502, r.status !== 400);
+  try {
+    const j = JSON.parse(t);
+    const msgs = j?.data?.chat?.messages || j?.data?.messages || [];
+    return Array.isArray(msgs) ? msgs : [];
+  } catch { return []; }
+}
+
+/** Wrap raw s16le PCM mono samples in a WAV container. */
+function pcmToWav(pcmBytes, sampleRate = 24000) {
+  const h = new ArrayBuffer(44);
+  const v = new DataView(h);
+  const wstr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  wstr(0, "RIFF");
+  v.setUint32(4, 36 + pcmBytes.length, true);
+  wstr(8, "WAVEfmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  wstr(36, "data");
+  v.setUint32(40, pcmBytes.length, true);
+  const out = new Uint8Array(44 + pcmBytes.length);
+  out.set(new Uint8Array(h), 0);
+  out.set(pcmBytes, 44);
+  return out;
+}
+
+/** OpenAI-compatible text-to-speech: POST /v1/audio/speech.
+ *  Body: {model?, input, voice?, response_format?}.
+ *  Upstream streams base64 s16le PCM 24kHz mono in delta.tts chunks;
+ *  we wrap it as WAV (universally playable). */
+async function handleSpeech(req, env, qwenOverride) {
+  let body;
+  try { body = await req.json(); }
+  catch { return oerr("Invalid JSON body", "invalid_request_error", 400); }
+  const input = String(body.input || "");
+  if (!input) return oerr("`input` is required", "invalid_request_error", 400);
+  if (input.length > 4000) return oerr("`input` too long (max 4000 chars)", "invalid_request_error", 400);
+  try {
+    const { result } = await withRotation(env, qwenOverride, async (token) => {
+      const chatId = await apiNewChat(token, "qwen3.8-max", "t2t", "speech");
+      const now = Date.now();
+      const msg = {
+        fid: crypto.randomUUID(), parentId: null, childrenIds: [],
+        role: "user", content: `Repeat the following text EXACTLY, character for character, with no additions or commentary:\n"""${input}"""`,
+        user_action: "chat", files: [], timestamp: now, models: ["qwen3.8-max"],
+        chat_type: "t2t", feature_config: featureConfig("none"),
+        extra: { meta: { subChatType: "t2t" } }, sub_chat_type: "t2t",
+      };
+      const res = await fetch(`${UPSTREAM}/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}`, {
+        method: "POST", headers: await upstreamHeaders(token),
+        body: JSON.stringify({
+          stream: true, version: "2.1", incremental_output: true, chat_id: chatId,
+          chat_mode: token ? "normal" : "guest", model: "qwen3.8-max", parent_id: null,
+          messages: [msg], timestamp: now,
+        }),
+      });
+      if (!res.ok || !res.body) throw new UpstreamError(`Upstream ${res.status}`, 502, true);
+      for await (const _ev of sseEvents(res)) { /* drain turn */ }
+      // Messages materialize shortly after the stream ends; poll briefly.
+      // Note: content may lag behind the id — the id alone suffices for TTS.
+      let asst = null;
+      for (let i = 0; i < 4; i++) {
+        const msgs = await chatMessages(token, chatId);
+        asst = [...msgs].reverse().find((m) => m.role === "assistant" && m.id);
+        if (asst) break;
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+      if (!asst) throw new UpstreamError("No assistant message to synthesize", 502, true);
+      const tts = await fetch(`${UPSTREAM}/api/v2/tts/completions?chat_id=${encodeURIComponent(chatId)}`, {
+        method: "POST", headers: await upstreamHeaders(token),
+        body: JSON.stringify({
+          chat_id: chatId, timestamp: Math.floor(Date.now() / 1000),
+          messages: [{ id: asst.id, role: "assistant", sub_chat_type: "tts" }],
+        }),
+      });
+      const ct = tts.headers.get("content-type") || "";
+      if (!tts.ok) {
+        const t = await tts.text().catch(() => "");
+        throw new UpstreamError(`TTS ${tts.status}: ${t.slice(0, 160)}`, tts.status === 401 ? 401 : 502, true);
+      }
+      if (ct.includes("audio/") || ct.includes("octet-stream")) {
+        const buf = await tts.arrayBuffer();
+        return { audio: new Uint8Array(buf), mime: ct.split(";")[0] };
+      }
+      const raw = await tts.text();
+      // Primary shape: SSE with base64 s16le PCM 24kHz mono in delta.tts
+      let pcm = "";
+      if (ct.includes("text/event-stream")) {
+        for (const line of raw.split("\n")) {
+          const t = line.trim();
+          if (!t.startsWith("data:")) continue;
+          const p = t.slice(5).trim();
+          if (p === "[DONE]") continue;
+          try { pcm += JSON.parse(p).choices?.[0]?.delta?.tts || ""; } catch { /* ignore */ }
+        }
+      }
+      if (pcm) {
+        const bin = atob(pcm);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        return { audio: pcmToWav(u8), mime: "audio/wav" };
+      }
+      // Fallbacks: embedded base64 audio or audio URL
+      const b64 = raw.match(/data:audio\/[a-z0-9+.-]+;base64,([A-Za-z0-9+/=]+)/i);
+      if (b64) {
+        const bin = atob(b64[1]);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        return { audio: u8, mime: "audio/mpeg" };
+      }
+      const um = raw.match(/https?:\/\/[^\s"'<>]+\.(mp3|wav|m4a|ogg|opus|flac)(\?[^\s"'<>]*)?/i);
+      if (um) {
+        const ar = await fetch(um[0]);
+        if (!ar.ok) throw new UpstreamError("audio fetch failed", 502, false);
+        return { audio: new Uint8Array(await ar.arrayBuffer()), mime: "audio/mpeg" };
+      }
+      throw new UpstreamError(`TTS unexpected shape (${ct || "no-ctype"}): ${raw.slice(0, 120)}`, 502, true);
+    });
+    if (result.audio.length > 25 * 1024 * 1024) throw new UpstreamError("audio too large", 502, false);
+    return new Response(result.audio, { headers: { "Content-Type": result.mime || "audio/mpeg", ...cors() } });
+  } catch (e) {
+    return oerr(`Upstream error: ${e.message}`, e.httpStatus === 400 ? "invalid_request_error" : "upstream_error", e.httpStatus || 502);
+  }
+}
+
+/** Anthropic Messages API compatibility: POST /v1/messages.
+ *  Accepts system/messages/tools in Anthropic shape, runs the same upstream
+ *  turn, translates the result back (text + tool_use blocks). */
+async function handleAnthropic(req, env, qwenOverride) {
+  let body;
+  try { body = await req.json(); }
+  catch { return json({ type: "error", error: { type: "invalid_request_error", message: "Invalid JSON body" } }, 400); }
+  const r = resolveModel({ ...body, model: body.model || "qwen3.8-max" });
+  if (r.error) return json({ type: "error", error: { type: "not_found_error", message: r.error } }, 400);
+  const msgs = Array.isArray(body.messages) ? body.messages : [];
+  if (!msgs.length) return json({ type: "error", error: { type: "invalid_request_error", message: "`messages` must be a non-empty array" } }, 400);
+  const stream = body.stream === true;
+  const sysText = typeof body.system === "string" ? body.system
+    : Array.isArray(body.system) ? body.system.filter((b) => b.type === "text").map((b) => b.text).join("\n") : "";
+
+  // Anthropic blocks -> OpenAI-ish messages + file inputs
+  const oaiMsgs = [];
+  if (sysText) oaiMsgs.push({ role: "system", content: sysText });
+  const fileInputs = [];
+  for (const m of msgs) {
+    if (typeof m.content === "string") { oaiMsgs.push({ role: m.role, content: m.content }); continue; }
+    const texts = [];
+    for (const b of m.content || []) {
+      if (b.type === "text") texts.push(b.text || "");
+      else if (b.type === "image") {
+        const s = b.source || {};
+        if (s.type === "base64" && s.data) fileInputs.push({ src: `data:${s.media_type || "image/jpeg"};base64,${s.data}`, name: "", presumed: "image" });
+        else if (s.type === "url" && (s.url || s.data)) fileInputs.push({ src: s.url || s.data, name: "", presumed: "image" });
+      } else if (b.type === "tool_use") texts.push(`[Called ${b.name} with ${JSON.stringify(b.input ?? {})}]`);
+      else if (b.type === "tool_result") {
+        const c = typeof b.content === "string" ? b.content : (b.content || []).filter((x) => x.type === "text").map((x) => x.text).join("\n");
+        texts.push(`[Tool result${b.tool_use_id ? ` for ${b.tool_use_id}` : ""}: ${c}]`);
+      }
+    }
+    oaiMsgs.push({ role: m.role, content: texts.join("\n") });
+  }
+  const fnTools = Array.isArray(body.tools) ? body.tools.map((t) => ({
+    type: "function",
+    function: { name: t.name, description: t.description || "", parameters: t.input_schema || { type: "object" } },
+  })) : [];
+  const wantsTools = fnTools.length > 0 && (!body.tool_choice || body.tool_choice.type !== "none");
+  const forced = body.tool_choice && body.tool_choice.type === "tool" ? body.tool_choice.name : null;
+
+  const prompt0 = buildPrompt(oaiMsgs).text;
+  const prompt = prompt0 + (wantsTools
+    ? `\n\n[System: functions available: ${JSON.stringify(fnTools.map((t) => t.function)).slice(0, 3000)}. ${forced ? `You MUST call ${forced}. ` : ""}If a function is needed, output ONLY this XML on the last line: <tool_calls>[{"name":"<fn>","arguments":{...}}]</tool_calls>]`
+    : "");
+
+  const run = async (token) => {
+    let files = [];
+    for (const f of fileInputs) {
+      try {
+        const { bytes, filename } = await bytesFromInput(f.src, f.name);
+        files.push(await uploadBytes(token, bytes, filename));
+      } catch { /* skip */ }
+    }
+    return { token, files };
+  };
+
+  const toAnthropic = (answer) => {
+    const blocks = [];
+    let stop = "end_turn";
+    if (wantsTools) {
+      const tc = xmlToolCalls(answer);
+      if (tc && tc.length) {
+        stop = "tool_use";
+        for (const c of tc) {
+          let args = {};
+          try { args = JSON.parse(c.function.arguments); } catch { /* keep {} */ }
+          blocks.push({ type: "tool_use", id: c.id, name: c.function.name, input: args });
+        }
+      }
+    }
+    const plain = answer.replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "").trim();
+    if (plain || !blocks.length) blocks.unshift({ type: "text", text: plain || answer });
+    return {
+      id: `msg_${crypto.randomUUID().slice(0, 8)}`, type: "message", role: "assistant",
+      content: blocks, model: r.requested, stop_reason: stop, stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    };
+  };
+
+  if (!stream) {
+    try {
+      const { result } = await withRotation(env, qwenOverride, async (token) => {
+        const { files } = await run(token);
+        let answer = "";
+        for await (const ev of runTurn(token, { model: r.base, chatType: r.chatType, prompt, files, effort: "none" })) {
+          if (ev.type === "content") answer += ev.data;
+        }
+        return { answer };
+      });
+      return json(toAnthropic(result.answer));
+    } catch (e) {
+      return json({ type: "error", error: { type: "api_error", message: `Upstream error: ${e.message}` } }, e.httpStatus || 502);
+    }
+  }
+
+  const pool0 = qwenOverride ? [qwenOverride] : (() => { const p = poolTokens(env); const n = Math.floor(Date.now() / 1000); void n; return p.length ? [p[Math.floor(Math.random() * p.length)]] : []; })();
+  const readable = new ReadableStream({
+    async start(controller) {
+      const enc = (ev, data) => controller.enqueue(new TextEncoder().encode(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`));
+      const msgId = `msg_${crypto.randomUUID().slice(0, 8)}`;
+      const attempt = async (token) => {
+        const { files } = await run(token);
+        let toolBuf = "", textBuf = "";
+        enc("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", content: [], model: r.requested, stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+        enc("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+        for await (const ev of runTurn(token, { model: r.base, chatType: r.chatType, prompt, files, effort: "none" })) {
+          if (ev.type !== "content") continue;
+          if (wantsTools) toolBuf += ev.data;
+          else { textBuf += ev.data; enc("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ev.data } }); }
+        }
+        if (wantsTools) {
+          const tc = xmlToolCalls(toolBuf);
+          if (tc && tc.length) {
+            enc("content_block_stop", { type: "content_block_stop", index: 0 });
+            tc.forEach((c, i) => {
+              let args = {};
+              try { args = JSON.parse(c.function.arguments); } catch { /* keep */ }
+              const idx = i + 1;
+              enc("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "tool_use", id: c.id, name: c.function.name, input: {} } });
+              enc("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(args) } });
+              enc("content_block_stop", { type: "content_block_stop", index: idx });
+            });
+            enc("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 0 } });
+          } else {
+            const plain = toolBuf.replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "").trim() || toolBuf;
+            if (plain !== textBuf && plain) enc("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: plain } });
+            enc("content_block_stop", { type: "content_block_stop", index: 0 });
+            enc("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } });
+          }
+        } else {
+          enc("content_block_stop", { type: "content_block_stop", index: 0 });
+          enc("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } });
+        }
+        enc("message_stop", { type: "message_stop" });
+      };
+      try {
+        if (pool0.length) {
+          try { await attempt(pool0[0]); }
+          catch (e) {
+            if (qwenOverride || !(e instanceof UpstreamError) || !e.retryable) throw e;
+            const rest = poolTokens(env).filter((t) => t !== pool0[0]);
+            if (!rest.length) {
+              const minted = await mintAny(env);
+              if (!minted) throw e;
+              await attempt(minted.access_token);
+            } else await attempt(rest[Math.floor(Math.random() * rest.length)]);
+          }
+        } else {
+          const minted = await mintAny(env);
+          if (!minted) throw new UpstreamError("No Qwen tokens and no session to mint from", 401, false);
+          await attempt(minted.access_token);
+        }
+      } catch (e) {
+        enc("message_stop", { type: "message_stop" });
+      } finally { controller.close(); }
+    },
+  });
+  return new Response(readable, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", ...cors() } });
 }
 
 async function handleValidate(req, env) {
@@ -892,7 +1272,7 @@ async function handleRefresh(req, env) {
   if (!token) token = pool[0] || "";
   if (!token) {
     // No token context at all: mint purely from the session jar, if present.
-    const minted0 = await mintViaAuth(authJar(env));
+    const minted0 = await mintAny(env);
     if (minted0) {
       return json({
         access_token: minted0.access_token, expires_at: minted0.expires_at,
@@ -947,6 +1327,7 @@ async function handleModels(env) {
   for (const m of TEXT_MODELS) {
     all.add(`${m}-search`); all.add(`${m}-thinking`);
     all.add(`${m}-deep-research`); all.add(`${m}-artifacts`); all.add(`${m}-slides`);
+    all.add(`${m}-agent`); all.add(`${m}-translate`); all.add(`${m}-podcast`);
   }
   return json({ object: "list", data: [...all].map((id) => ({ id, object: "model", created: 0, owned_by: "qwen" })) });
 }
@@ -1003,11 +1384,13 @@ export default {
         ok: true, service: "qwen-code-proxy", upstream: UPSTREAM,
         gated: Boolean(env.PROXY_KEY), pool_size: poolTokens(env).length,
         auto_refresh: authJars(env).length > 0, sessions: authJars(env).length,
-        endpoints: ["/health", "/v1/models", "/v1/validate", "/v1/refresh", "/v1/chat/completions", "/v1/images/generations", "/v1/images/edits", "/v1/videos/generations"],
+        endpoints: ["/health", "/v1/models", "/v1/validate", "/v1/refresh", "/v1/chat/completions", "/v1/messages", "/v1/images/generations", "/v1/images/edits", "/v1/videos/generations", "/v1/audio/speech", "/llms.txt"],
         time: new Date().toISOString(),
       });
 
     if (path === "/v1/models") return handleModels(env);
+    if (path === "/llms.txt" || path === "/llms-full.txt" || path === "/docs")
+      return new Response(LLMS_TXT, { headers: { "Content-Type": "text/plain; charset=utf-8", ...cors() } });
 
     // everything below is gated when PROXY_KEY is set
     const gate = checkGate(req, env);
@@ -1017,6 +1400,15 @@ export default {
     if (path === "/v1/validate" || path === "/validate") return handleValidate(req, env);
     if (path === "/v1/refresh" || path === "/refresh") return handleRefresh(req, env);
     if (path === "/v1/chat/completions" && req.method === "POST") return handleChat(req, env, qwenOverride);
+    if ((path === "/v1/messages" || path === "/v1/messages/count_tokens") && req.method === "POST") {
+      if (path.endsWith("count_tokens")) {
+        let b; try { b = await req.json(); } catch { return json({ type: "error", error: { type: "invalid_request_error", message: "Invalid JSON" } }, 400); }
+        const n = JSON.stringify(b.messages || []).length;
+        return json({ input_tokens: Math.ceil(n / 4) });
+      }
+      return handleAnthropic(req, env, qwenOverride);
+    }
+    if (path === "/v1/audio/speech" && req.method === "POST") return handleSpeech(req, env, qwenOverride);
     if (path === "/v1/images/generations" && req.method === "POST") return handleMedia(req, env, qwenOverride, "t2i");
     if (path === "/v1/images/edits" && req.method === "POST") return handleMedia(req, env, qwenOverride, "image_edit");
     if (path === "/v1/videos/generations" && req.method === "POST") return handleMedia(req, env, qwenOverride, "t2v");
