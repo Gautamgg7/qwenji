@@ -165,9 +165,39 @@ class UpstreamError extends Error {
   constructor(message, httpStatus = 502, retryable = true) { super(message); this.httpStatus = httpStatus; this.retryable = retryable; }
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Fetch with WAF/429/5xx retries (jittered backoff). HTML bodies mean WAF.
+ *  Final WAF failure is non-retryable across sessions (same egress IP). */
+async function upstreamFetch(url, opts, retries = 3) {
+  const waits = [4000, 10000, 25000];
+  for (let i = 0; ; i++) {
+    let res;
+    try {
+      res = await fetch(url, opts);
+    } catch (e) {
+      if (i >= retries) throw new UpstreamError(`Upstream fetch failed: ${e.message}`, 502, true);
+      await sleep(waits[Math.min(i, 2)] + Math.random() * 2000);
+      continue;
+    }
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("html")) {
+      try { if (res.body) await res.body.cancel(); } catch { /* ignore */ }
+      if (i >= retries) throw new UpstreamError("Upstream WAF throttled this IP (cools down in a few minutes)", 429, false);
+      await sleep(waits[Math.min(i, 2)] + Math.random() * 2000);
+      continue;
+    }
+    if ((res.status === 429 || res.status >= 500) && i < retries) {
+      await sleep(waits[Math.min(i, 2)] + Math.random() * 2000);
+      continue;
+    }
+    return res;
+  }
+}
+
 async function apiNewChat(token, model, chatType, title) {
   const now = Date.now();
-  const res = await fetch(`${UPSTREAM}/api/v2/chats/new`, {
+  const res = await upstreamFetch(`${UPSTREAM}/api/v2/chats/new`, {
     method: "POST",
     headers: await upstreamHeaders(token),
     body: JSON.stringify({
@@ -509,7 +539,7 @@ async function* runTurn(token, { model, chatType, prompt, files, effort, size })
     thinking_mode: effort === "high" ? "Thinking" : effort === "medium" ? "Auto" : "Fast",
   };
   if (size) payload.size = size;
-  const res = await fetch(`${UPSTREAM}/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}`, {
+  const res = await upstreamFetch(`${UPSTREAM}/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}`, {
     method: "POST", headers: await upstreamHeaders(token), body: JSON.stringify(payload),
   });
   if (!res.ok || !res.body) {
@@ -921,7 +951,7 @@ async function handleMedia(req, env, qwenOverride, kind) {
 
 /** Fetch chat messages (for ids etc.). Returns array (may be empty). */
 async function chatMessages(token, chatId) {
-  const r = await fetch(`${UPSTREAM}/api/v2/chats/${encodeURIComponent(chatId)}`, {
+  const r = await upstreamFetch(`${UPSTREAM}/api/v2/chats/${encodeURIComponent(chatId)}`, {
     headers: await upstreamHeaders(token),
   });
   const t = await r.text();
@@ -978,7 +1008,7 @@ async function handleSpeech(req, env, qwenOverride) {
         chat_type: "t2t", feature_config: featureConfig("none"),
         extra: { meta: { subChatType: "t2t" } }, sub_chat_type: "t2t",
       };
-      const res = await fetch(`${UPSTREAM}/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}`, {
+      const res = await upstreamFetch(`${UPSTREAM}/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}`, {
         method: "POST", headers: await upstreamHeaders(token),
         body: JSON.stringify({
           stream: true, version: "2.1", incremental_output: true, chat_id: chatId,
@@ -998,7 +1028,7 @@ async function handleSpeech(req, env, qwenOverride) {
         await new Promise((r) => setTimeout(r, 2000));
       }
       if (!asst) throw new UpstreamError("No assistant message to synthesize", 502, true);
-      const tts = await fetch(`${UPSTREAM}/api/v2/tts/completions?chat_id=${encodeURIComponent(chatId)}`, {
+      const tts = await upstreamFetch(`${UPSTREAM}/api/v2/tts/completions?chat_id=${encodeURIComponent(chatId)}`, {
         method: "POST", headers: await upstreamHeaders(token),
         body: JSON.stringify({
           chat_id: chatId, timestamp: Math.floor(Date.now() / 1000),
@@ -1303,12 +1333,15 @@ async function handleRefresh(req, env) {
   }
 }
 
+let modelsCache = { at: 0, body: null };
+
 async function handleModels(env) {
+  if (modelsCache.body && Date.now() - modelsCache.at < 5 * 60 * 1000) return modelsCache.body.clone();
   const pool = poolTokens(env);
   if (pool.length) {
     for (const i of shuffled(pool.length)) {
       try {
-        const r = await fetch(`${UPSTREAM}/api/models`, { headers: await upstreamHeaders(pool[i]) });
+        const r = await upstreamFetch(`${UPSTREAM}/api/models`, { headers: await upstreamHeaders(pool[i]) }, 1);
         const j = await r.json();
         const ids = (j.data || []).map((m) => m.id).filter(Boolean);
         if (ids.length) {
@@ -1318,7 +1351,9 @@ async function handleModels(env) {
             variants.add(`${m}-deep-research`); variants.add(`${m}-artifacts`); variants.add(`${m}-slides`);
           }
           for (const s of Object.keys(SPECIAL)) variants.add(s);
-          return json({ object: "list", data: [...variants].map((id) => ({ id, object: "model", created: 0, owned_by: "qwen" })) });
+          const out = json({ object: "list", data: [...variants].map((id) => ({ id, object: "model", created: 0, owned_by: "qwen" })) });
+          modelsCache = { at: Date.now(), body: out.clone() };
+          return out;
         }
       } catch { /* try next / fallback */ }
     }
@@ -1329,7 +1364,9 @@ async function handleModels(env) {
     all.add(`${m}-deep-research`); all.add(`${m}-artifacts`); all.add(`${m}-slides`);
     all.add(`${m}-agent`); all.add(`${m}-translate`); all.add(`${m}-podcast`);
   }
-  return json({ object: "list", data: [...all].map((id) => ({ id, object: "model", created: 0, owned_by: "qwen" })) });
+  const out2 = json({ object: "list", data: [...all].map((id) => ({ id, object: "model", created: 0, owned_by: "qwen" })) });
+  modelsCache = { at: Date.now(), body: out2.clone() };
+  return out2;
 }
 
 /* ---------------- scheduled cron ---------------- */
