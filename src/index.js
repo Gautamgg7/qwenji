@@ -1366,6 +1366,40 @@ async function scheduledRefresh(env) {
   return { refreshed: minted.length, sessions: authJars(env).length, secretsPersisted: Boolean(okSecrets) };
 }
 
+/** List all chat ids for a token. */
+async function apiListChats(token) {
+  const r = await fetch(`${UPSTREAM}/api/v2/chats/`, { headers: await upstreamHeaders(token) });
+  const t = await r.text();
+  if (!r.ok) throw new UpstreamError(`chat list ${r.status}`, r.status === 401 ? 401 : 502, true);
+  try {
+    const j = JSON.parse(t);
+    const items = Array.isArray(j.data) ? j.data : j.data?.chats || j.data?.list || [];
+    return items.map((c) => c.id || c.chat_id).filter(Boolean);
+  } catch { return []; }
+}
+
+/** Real delete-all-chats (per session). Destructive: uses pool tokens only. */
+async function handleChatsDelete(req, env) {
+  const pool = poolTokens(env);
+  if (!pool.length) return oerr("No pool tokens configured (refusing cookie-mint delete)", "invalid_request_error", 400);
+  const per = [];
+  let total = 0;
+  for (let i = 0; i < pool.length; i++) {
+    try {
+      const ids = await apiListChats(pool[i]);
+      if (!ids.length) { per.push({ index: i, deleted: 0 }); continue; }
+      const r = await fetch(`${UPSTREAM}/api/v2/chats/batch_delete`, {
+        method: "POST", headers: await upstreamHeaders(pool[i]),
+        body: JSON.stringify({ ids }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && (j.success || j.data?.status)) { total += ids.length; per.push({ index: i, deleted: ids.length }); }
+      else per.push({ index: i, deleted: 0, error: JSON.stringify(j).slice(0, 100) });
+    } catch (e) { per.push({ index: i, deleted: 0, error: String(e.message).slice(0, 100) }); }
+  }
+  return json({ deleted: total, sessions: per });
+}
+
 /* ---------------- entry ---------------- */
 
 export default {
@@ -1413,7 +1447,7 @@ export default {
     if (path === "/v1/images/edits" && req.method === "POST") return handleMedia(req, env, qwenOverride, "image_edit");
     if (path === "/v1/videos/generations" && req.method === "POST") return handleMedia(req, env, qwenOverride, "t2v");
     if (path === "/v1/chats/delete")
-      return oerr("Chat deletion is not exposed by the upstream web API; manage chats at chat.qwen.ai", "not_supported", 501);
+      return handleChatsDelete(req, env);
 
     return oerr(`Unknown route ${url.pathname}`, "not_found", 404);
   },
