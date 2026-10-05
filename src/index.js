@@ -167,11 +167,20 @@ class UpstreamError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Minimum gap between upstream calls (per isolate): bursts trip the WAF. */
+let lastUpstreamAt = 0;
+async function pace(gapMs = 1200) {
+  const wait = lastUpstreamAt + gapMs - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastUpstreamAt = Date.now();
+}
+
 /** Fetch with WAF/429/5xx retries (jittered backoff). HTML bodies mean WAF.
  *  Final WAF failure is non-retryable across sessions (same egress IP). */
 async function upstreamFetch(url, opts, retries = 3) {
   const waits = [4000, 10000, 25000];
   for (let i = 0; ; i++) {
+    await pace();
     let res;
     try {
       res = await fetch(url, opts);
