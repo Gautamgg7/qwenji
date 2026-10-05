@@ -866,7 +866,7 @@ async function handleChat(req, env, qwenOverride) {
         }
         if (!done && !qwenOverride) {
           const minted2 = await mintAny(env);
-          if (minted) {
+          if (minted2) {
             try { await attempt(minted2.access_token); done = true; }
             catch (e) { lastErr = e; }
           }
