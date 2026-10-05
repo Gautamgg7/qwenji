@@ -752,7 +752,8 @@ async function handleChat(req, env, qwenOverride) {
   if (!body.messages?.length) return oerr("`messages` must be a non-empty array", "invalid_request_error", 400);
   const stream = body.stream === true;
   const forResearch = r.chatType === "deep_research";
-  const effort = effortOf(body, forResearch);
+  let effort = effortOf(body, forResearch);
+  if (Array.isArray(body.tools) && body.tools.length && body.tool_choice !== "none") effort = "none";
 
   let prompt, fileInputs;
   try {
