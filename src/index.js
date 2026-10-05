@@ -26,7 +26,7 @@ function authJars(env) {
   const out = [];
   const push = (j) => { j = (j || "").trim(); if (j.length > 20 && !out.includes(j)) out.push(j); };
   push(authCache.jar);
-  for (const j of String(env.QWEN_AUTH || "").split(/\r?\n/)) push(j);
+  for (const j of String(env.QWEN_AUTH || "").replace(/\\n/g, "\n").split(/[\r\n;|]+/)) push(j);
   return out;
 }
 
