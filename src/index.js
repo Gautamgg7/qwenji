@@ -69,7 +69,7 @@ async function mintViaAuth(jar) {
 }
 
 const TEXT_MODELS = [
-  "qwen3.8-max", "qwen3.8-max-preview", "qwen3.7-plus", "qwen3.7-max",
+  "qwen3.8-max", "qwen3.8-max-preview", "qwen3.8-omni-flash", "qwen3.7-plus", "qwen3.7-max",
   "qwen3.6-plus", "qwen3.6-max-preview", "qwen3.6-27b", "qwen3.5-plus",
   "qwen3.5-omni-plus", "qwen3.5-flash", "qwen3.5-max-2026-03-08",
   "qwen3.5-397b-a17b", "qwen3.5-122b-a10b", "qwen3.5-omni-flash",
