@@ -239,9 +239,53 @@ function resolveModel(body) {
   return { base, chatType, requested: String(body.model) };
 }
 
-/** Build single-string prompt + collect image inputs from OpenAI messages. */
+/** File limits mirroring the documented upstream contract.
+ *  Images ≤5 × 20MB; audio ≤1 × 2000MB; video ≤1 × 2000MB; documents ≤5 × 20MB.
+ *  Agent-mode aggregate: ≤10 files, ≤20MB each (media streams capped lower),
+ *  ≤50MB total. Worker reality: single fetch capped at 50MB. */
+const FILE_LIMITS = {
+  image: { maxCount: 5, maxBytes: 20 * 1024 * 1024 },
+  audio: { maxCount: 1, maxBytes: 2000 * 1024 * 1024 },
+  video: { maxCount: 1, maxBytes: 2000 * 1024 * 1024 },
+  document: { maxCount: 5, maxBytes: 20 * 1024 * 1024 },
+};
+const AGENT_LIMITS = { maxFiles: 10, maxBytesEach: 20 * 1024 * 1024, maxBytesTotal: 50 * 1024 * 1024 };
+const FETCH_CAP = 55 * 1024 * 1024;
+
+function guessKind(mime, name) {
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("audio/")) return "audio";
+  if (mime.startsWith("video/")) return "video";
+  return "document";
+}
+
+function mimeOfSrc(src, fallbackName) {
+  if (typeof src === "string" && src.startsWith("data:")) {
+    const m = src.slice(5, src.indexOf(",")).split(";")[0];
+    if (m && m.includes("/")) return m;
+  }
+  const nm = (fallbackName || src || "").split("?")[0].toLowerCase();
+  if (/\.jpe?g$/.test(nm)) return "image/jpeg";
+  if (/\.png$/.test(nm)) return "image/png";
+  if (/\.gif$/.test(nm)) return "image/gif";
+  if (/\.webp$/.test(nm)) return "image/webp";
+  if (/\.mp3$/.test(nm)) return "audio/mpeg";
+  if (/\.wav$/.test(nm)) return "audio/wav";
+  if (/\.m4a$/.test(nm)) return "audio/mp4";
+  if (/\.mp4$/.test(nm)) return "video/mp4";
+  if (/\.webm$/.test(nm)) return "video/webm";
+  if (/\.pdf$/.test(nm)) return "application/pdf";
+  if (/\.docx?$/.test(nm)) return "application/msword";
+  if (/\.pptx?$/.test(nm)) return "application/vnd.ms-powerpoint";
+  if (/\.txt$/.test(nm)) return "text/plain";
+  return "application/octet-stream";
+}
+
+/** Build single-string prompt + collect file inputs from OpenAI messages.
+ *  Accepts image_url parts (any file type via URL/base64), file parts
+ *  ({type:"file", file:{file_data|url|filename}}), and input_audio parts. */
 function buildPrompt(messages) {
-  const images = [];
+  const files = [];
   const lines = [];
   for (const m of messages || []) {
     const role = m.role === "assistant" ? "Assistant" : m.role === "system" ? "System" : "User";
@@ -253,14 +297,39 @@ function buildPrompt(messages) {
         if (p.type === "text" && p.text) texts.push(p.text);
         else if (p.type === "image_url") {
           const u = p.image_url?.url || p.image_url || "";
-          if (u) images.push(u);
+          if (u) files.push({ src: u, name: "", presumed: "image" });
+        } else if (p.type === "file" && p.file) {
+          const f = p.file.file_data || p.file.url || p.file.content || "";
+          if (f) files.push({ src: f, name: p.file.filename || p.file.name || "", presumed: "" });
+        } else if (p.type === "input_audio" && p.input_audio) {
+          const a = p.input_audio.data || "";
+          if (a) {
+            const fmt = (p.input_audio.format || "mp3").toLowerCase();
+            const src = a.startsWith("data:") || /^https?:\/\//i.test(a) ? a : `data:audio/${fmt};base64,${a}`;
+            files.push({ src, name: `audio.${fmt}`, presumed: "audio" });
+          }
         }
       }
       const t = texts.join("\n");
       lines.push(messages.length === 1 && m.role === "user" ? t : `${role}: ${t}`);
     }
   }
-  return { text: lines.join("\n\n") || "", images };
+  return { text: lines.join("\n\n") || "", files };
+}
+
+/** Validate file combination; returns {ok} or {error}. */
+function checkCombo(kinds) {
+  const count = (k) => kinds.filter((x) => x === k).length;
+  for (const k of Object.keys(FILE_LIMITS)) {
+    if (count(k) > FILE_LIMITS[k].maxCount)
+      return { error: `Too many ${k} files (max ${FILE_LIMITS[k].maxCount})` };
+  }
+  const has = (k) => count(k) > 0;
+  if ((has("image") && has("audio")) || (has("image") && has("video")) || (has("audio") && has("video")))
+    return { error: "Invalid combination: media files cannot be mixed (image+audio, image+video, audio+video). Pair media with documents instead." };
+  if (kinds.length > AGENT_LIMITS.maxFiles)
+    return { error: `Too many files (max ${AGENT_LIMITS.maxFiles})` };
+  return { ok: true };
 }
 
 function lastText(messages) {
@@ -358,7 +427,20 @@ async function bytesFromInput(input, filename) {
   if (/^https?:\/\//i.test(input)) {
     const r = await fetch(input);
     if (!r.ok) throw new Error(`download failed (${r.status})`);
-    const buf = new Uint8Array(await r.arrayBuffer());
+    // Bounded read: never buffer more than FETCH_CAP (Worker memory limits).
+    const reader = r.body.getReader();
+    const chunks = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > FETCH_CAP) { try { reader.cancel(); } catch {} throw new Error(`download exceeds ${FETCH_CAP} bytes worker cap`); }
+      chunks.push(value);
+    }
+    const buf = new Uint8Array(size);
+    let off = 0;
+    for (const c of chunks) { buf.set(c, off); off += c.length; }
     const nm = input.split("?")[0].split("/").pop() || filename || "remote.bin";
     return { bytes: buf, filename: nm };
   }
@@ -552,12 +634,16 @@ async function handleChat(req, env, qwenOverride) {
   const forResearch = r.chatType === "deep_research";
   const effort = effortOf(body, forResearch);
 
-  let prompt, images;
+  let prompt, fileInputs;
   try {
     const b = buildPrompt(body.messages);
-    prompt = b.text; images = b.images;
+    prompt = b.text; fileInputs = b.files;
   } catch (e) { return oerr(e.message, "invalid_request_error", 400); }
-  if (!prompt && !images.length) return oerr("Empty messages", "invalid_request_error", 400);
+  if (!prompt && !fileInputs.length) return oerr("Empty messages", "invalid_request_error", 400);
+  // Combination + count rules (400 fast, before burning quota).
+  const kindOf = (f) => f.presumed || guessKind(mimeOfSrc(f.src, f.name), f.name);
+  const combo = checkCombo(fileInputs.map(kindOf));
+  if (combo.error) return oerr(combo.error, "invalid_request_error", 400);
 
   let fnTools = null;
   if (Array.isArray(body.tools) && body.tools.length && body.tool_choice !== "none")
@@ -569,10 +655,37 @@ async function handleChat(req, env, qwenOverride) {
 
   const run = async (token) => {
     let files = [];
-    for (const img of images.slice(0, 4)) {
-      const { bytes, filename } = await bytesFromInput(img);
-      files.push(await uploadBytes(token, bytes, filename));
+    let totalBytes = 0;
+    const realKinds = [];
+    for (const f of fileInputs) {
+      let raw;
+      try {
+        raw = await bytesFromInput(f.src, f.name);
+      } catch {
+        continue; // upload fallback: skip failed attachments, continue text-only
+      }
+      const [, realMime] = detectType(raw.bytes.slice(0, 12));
+      const kind = (realMime !== "application/octet-stream" ? guessKind(realMime, raw.filename) : null)
+        || f.presumed
+        || guessKind(mimeOfSrc(f.src, raw.filename), raw.filename);
+      const lim = FILE_LIMITS[kind];
+      if (raw.bytes.length > lim.maxBytes)
+        throw new UpstreamError(`${kind} file too large (max ${Math.round(lim.maxBytes / 1048576)}MB)`, 400, false);
+      if (raw.bytes.length > AGENT_LIMITS.maxBytesEach)
+        throw new UpstreamError(`file too large (agent max ${Math.round(AGENT_LIMITS.maxBytesEach / 1048576)}MB each)`, 400, false);
+      totalBytes += raw.bytes.length;
+      if (totalBytes > AGENT_LIMITS.maxBytesTotal)
+        throw new UpstreamError(`attachments exceed ${Math.round(AGENT_LIMITS.maxBytesTotal / 1048576)}MB total`, 400, false);
+      try {
+        files.push(await uploadBytes(token, raw.bytes, raw.filename));
+        realKinds.push(kind);
+      } catch {
+        continue; // upload fallback: skip, continue text-only
+      }
     }
+    // Re-check rules against sniffed real types (extensionless URLs etc.).
+    const combo2 = checkCombo(realKinds);
+    if (combo2.error) throw new UpstreamError(combo2.error, 400, false);
     return { token, files };
   };
 
@@ -593,7 +706,7 @@ async function handleChat(req, env, qwenOverride) {
       }
       return json(envelope(r.requested, result.answer, result.reasoning || null));
     } catch (e) {
-      return oerr(`Upstream error: ${e.message}`, e.httpStatus === 401 ? "authentication_error" : "upstream_error", e.httpStatus || 502);
+      return oerr(`Upstream error: ${e.message}`, e.httpStatus === 401 ? "authentication_error" : e.httpStatus === 400 ? "invalid_request_error" : "upstream_error", e.httpStatus || 502);
     }
   }
 
@@ -721,7 +834,7 @@ async function handleMedia(req, env, qwenOverride, kind) {
     }
     return json({ created: Math.floor(Date.now() / 1000), data: result.urls.map((u) => ({ url: u })) });
   } catch (e) {
-    return oerr(`Upstream error: ${e.message}`, "upstream_error", e.httpStatus || 502);
+    return oerr(`Upstream error: ${e.message}`, e.httpStatus === 400 ? "invalid_request_error" : "upstream_error", e.httpStatus || 502);
   }
 }
 
