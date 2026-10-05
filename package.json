@@ -4,6 +4,7 @@
     "tail": "wrangler tail",
     "secret:tokens": "wrangler secret put QWEN_TOKENS",
     "secret:auth": "wrangler secret put QWEN_AUTH",
+    "secret:cf": "wrangler secret put CF_API_TOKEN",
     "secret:proxy": "wrangler secret put PROXY_KEY",
     "secrets:list": "wrangler secret list"
   }}
