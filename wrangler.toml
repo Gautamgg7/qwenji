@@ -1,0 +1,16 @@
+name = "qwen-code-proxy"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Cloudflare cron: mint fresh tokens every 10 minutes (backup loop).
+[triggers]
+crons = ["*/10 * * * *"]
+
+[vars]
+# Optional defaults (secrets override these). Do NOT put real tokens here.
+# QWEN_TOKENS = ""
+# QWEN_AUTH = ""
+# PROXY_KEY = ""
+# CF_API_TOKEN / CF_ACCOUNT_ID / CF_WORKER_NAME enable secret self-persistence.
+CF_ACCOUNT_ID = "9c7d3b4d8b7bb545e95540dc60aed6cd"
+CF_WORKER_NAME = "qwen-code-proxy"

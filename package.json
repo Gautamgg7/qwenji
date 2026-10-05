@@ -1,0 +1,9 @@
+{"name": "qwen-code-proxy", "private": true, "version": "1.0.0", "type": "module",   "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "secret:tokens": "wrangler secret put QWEN_TOKENS",
+    "secret:auth": "wrangler secret put QWEN_AUTH",
+    "secret:proxy": "wrangler secret put PROXY_KEY",
+    "secrets:list": "wrangler secret list"
+  }}
